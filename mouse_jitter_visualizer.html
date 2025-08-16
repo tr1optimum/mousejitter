@@ -1,0 +1,335 @@
+// License
+Copyright 2025 "tr1optimum" (tr1optimumplays@gmail.com) . All rights reserved. No part of this repository may be copied, modified, or distributed without permission.
+//
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Mouse Jitter Visualizer</title>
+  <style>
+    :root {
+      --bg: #0b0f14;
+      --panel: #121821;
+      --text: #e8f0ff;
+      --muted: #9db0c9;
+      --accent: #3ee07f;
+      --danger: #ff5e5e;
+      --grid: #1a2230;
+    }
+    html, body {
+      height: 100%;
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      overflow: hidden;
+    }
+    #ui {
+      position: fixed;
+      top: 12px; left: 12px;
+      background: var(--panel);
+      border-radius: 14px;
+      box-shadow: 0 6px 24px rgba(0,0,0,.35);
+      padding: 12px 14px;
+      display: grid;
+      grid-auto-flow: row;
+      gap: 8px;
+      min-width: 280px;
+      z-index: 20;
+      user-select: none;
+    }
+    #ui h1 { font-size: 16px; margin: 0 0 6px 0; letter-spacing: 0.4px; color: var(--muted); }
+    #ui .row { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 8px; }
+    #ui label { font-size: 12px; color: var(--muted); }
+    #ui .val { font-variant-numeric: tabular-nums; font-size: 12px; color: var(--text); }
+    #ui button {
+      background: var(--accent);
+      color: #06240f;
+      border: none; border-radius: 10px;
+      padding: 8px 10px; font-weight: 700; cursor: pointer;
+    }
+    #ui button.secondary { background: #2a3546; color: var(--text); }
+    #ui button.danger { background: var(--danger); color: #290a0a; }
+    #note { font-size: 11px; color: var(--muted); line-height: 1.3; }
+    #can { position: absolute; inset: 0; }
+    #legend { position: fixed; right: 12px; top: 12px; background: var(--panel); padding: 10px 12px; border-radius: 12px; font-size: 12px; color: var(--muted); }
+    a { color: var(--accent); text-decoration: none; }
+    #exportStatsBtn { background: #2a3546; color: var(--text); }
+  </style>
+</head>
+<body>
+  <canvas id="can"></canvas>
+  <div id="ui">
+    <h1>Mouse Jitter Visualizer</h1>
+
+    <div class="row"><label>FPS</label><div class="val" id="fps">0</div></div>
+    <div class="row"><label>Events/sec</label><div class="val" id="eps">0</div></div>
+    <div class="row"><label>RMS Δ (px)</label><div class="val" id="rms">0.00</div></div>
+
+    <div class="row">
+      <label for="len">Trail length</label>
+      <input id="len" type="range" min="50" max="4000" value="800" />
+    </div>
+    <div class="row">
+      <label for="scale">Scope scale</label>
+      <input id="scale" type="range" min="0.1" max="2" step="0.1" value="0.5" />
+    </div>
+    <div class="row">
+      <label for="gain">Smoothing</label>
+      <input id="gain" type="range" min="0" max="0.95" step="0.01" value="0.1" />
+    </div>
+
+    <div class="row">
+      <button id="anchorBtn" class="secondary">Set anchor</button>
+      <button id="pauseBtn" class="secondary">Pause</button>
+    </div>
+    <div class="row">
+      <button id="clearBtn" class="danger">Clear</button>
+      <button id="copyBtn" class="secondary" title="Copy summary stats to clipboard">Copy stats</button>
+    </div>
+    <div class="row">
+      <button id="exportStatsBtn" class="secondary" title="Export session stats as JSON">Export JSON</button>
+    </div>
+
+    <div id="note">Tip: scroll to adjust scale, left-click to set anchor, right-click to clear. (A=anchor, P=pause, C=clear)</div>
+  </div>
+  <div id="legend">Δx trace, Δy trace, radial scatter around anchor</div>
+
+<script>
+(function(){
+  const can = document.getElementById('can');
+  const ctx = can.getContext('2d');
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  let W = 0, H = 0;
+  function resize(){
+    W = can.width = Math.floor(innerWidth * dpr);
+    H = can.height = Math.floor(innerHeight * dpr);
+    can.style.width = innerWidth + 'px';
+    can.style.height = innerHeight + 'px';
+  }
+  window.addEventListener('resize', resize); resize();
+
+  const $ = id => document.getElementById(id);
+  const fpsEl = $('fps'), epsEl = $('eps'), rmsEl = $('rms');
+  const lenEl = $('len'), scaleEl = $('scale'), gainEl = $('gain');
+  const anchorBtn = $('anchorBtn'), pauseBtn = $('pauseBtn');
+  const clearBtn = $('clearBtn'), copyBtn = $('copyBtn');
+  const exportBtn = $('exportStatsBtn');
+
+  let paused = false;
+  let anchor = { x: W/2, y: H/2 };
+  let rel = { x: 0, y: 0 };
+  let vel = { x: 0, y: 0 };
+  let deltas = [];
+  let positions = [];
+  let lastMove = performance.now();
+  let eventsInSecond = 0, eps = 0;
+  let lastSecond = Math.floor(lastMove/1000);
+  let frames = 0, lastFpsTime = performance.now(), fps = 0;
+
+  function pushDelta(dx, dy, t){
+    const nowSec = Math.floor(t/1000);
+    if (nowSec !== lastSecond){ eps = eventsInSecond; eventsInSecond = 0; lastSecond = nowSec; }
+    eventsInSecond++;
+
+    const len = +lenEl.value;
+    deltas.push({dx, dy, t});
+    if (deltas.length > len) deltas.shift();
+
+    const g = +gainEl.value;
+    vel.x = vel.x*(1-g) + dx;
+    vel.y = vel.y*(1-g) + dy;
+    rel.x += vel.x; rel.y += vel.y;
+
+    positions.push({x: rel.x, y: rel.y});
+    if (positions.length > len) positions.shift();
+  }
+
+  window.addEventListener('mousemove', ev => {
+    const t = performance.now();
+    let dx = (typeof ev.movementX === 'number') ? ev.movementX : (ev.clientX - prevMouse.x);
+    let dy = (typeof ev.movementY === 'number') ? ev.movementY : (ev.clientY - prevMouse.y);
+    if (Number.isNaN(dx) || Number.isNaN(dy)) { dx = 0; dy = 0; }
+    prevMouse.x = ev.clientX; prevMouse.y = ev.clientY;
+    lastMove = t;
+    if (!paused) pushDelta(dx, dy, t);
+  }, {passive:true});
+
+  let prevMouse = { x: 0, y: 0 };
+
+  function setAnchor(){ anchor = { x: W/2, y: H/2 }; rel = {x:0,y:0}; vel = {x:0,y:0}; positions.length = 0; }
+  function clearData(){ deltas.length = 0; positions.length = 0; rel = {x:0,y:0}; vel = {x:0,y:0}; }
+
+  anchorBtn.addEventListener('click', setAnchor);
+  pauseBtn.addEventListener('click', () => { paused = !paused; pauseBtn.textContent = paused ? 'Resume' : 'Pause'; });
+  clearBtn.addEventListener('click', clearData);
+
+  // Mouse wheel for scale
+  window.addEventListener('wheel', e => {
+    e.preventDefault();
+    let s = parseFloat(scaleEl.value);
+    const delta = -e.deltaY; // flip so positive always zooms in
+    s += delta * 0.002;      // scale sensitivity
+    s = Math.min(2, Math.max(0.1, s)); // clamp
+    scaleEl.value = s.toFixed(2);
+}, {passive:false});
+
+  // Left/right mouse for anchor/clear
+  window.addEventListener('mousedown', e => {
+    if (e.button === 0) { // left click
+      setAnchor();
+    } else if (e.button === 2) { // right click
+      clearData();
+    }
+  });
+  window.addEventListener('contextmenu', e => e.preventDefault()); // disable right-click menu
+
+  copyBtn.addEventListener('click', async () => {
+    const stats = computeStats();
+    const text = `Mouse Jitter Stats\nEvents/sec: ${eps}\nFPS: ${fps}\nRMS Δ (px): ${stats.rms.toFixed(4)}\nMean |Δ|: ${stats.meanMag.toFixed(4)}\nSamples: ${deltas.length}`;
+    try { await navigator.clipboard.writeText(text); copyBtn.textContent = 'Copied'; setTimeout(()=>copyBtn.textContent='Copy stats', 1200);} catch(e){ alert(text); }
+  });
+
+  exportBtn.addEventListener('click', () => {
+    const stats = computeStats();
+    const session = {
+      timestamp: new Date().toISOString(),
+      fps,
+      eps,
+      samples: deltas.length,
+      rms: stats.rms,
+      meanMagnitude: stats.meanMag,
+      deltas: deltas.slice(-1000)
+    };
+    const blob = new Blob([JSON.stringify(session, null, 2)], {type: 'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'mouse_jitter_stats.json';
+    a.click();
+    URL.revokeObjectURL(url);
+  });
+
+  window.addEventListener('keydown', e => {
+    const k = e.key.toLowerCase();
+    if (k === 'a') setAnchor();
+    if (k === 'p') { paused = !paused; pauseBtn.textContent = paused ? 'Resume' : 'Pause'; }
+    if (k === 'c') clearData();
+  });
+
+  function computeStats(){
+    let sumSq = 0, sumMag = 0;
+    for (const d of deltas){ const m = Math.hypot(d.dx, d.dy); sumMag += m; sumSq += (d.dx*d.dx + d.dy*d.dy); }
+    const n = Math.max(1, deltas.length);
+    return { rms: Math.sqrt(sumSq / n), meanMag: sumMag / n };
+  }
+
+  function drawGrid(cx, cy, scale){
+    ctx.fillStyle = '#0b0f14';
+    ctx.fillRect(0,0,W,H);
+
+    ctx.strokeStyle = '#15202d';
+    ctx.lineWidth = 1;
+    ctx.globalAlpha = 1;
+    const step = 40 * scale;
+    ctx.beginPath();
+    for (let x = (W/2)%step; x < W; x += step){ ctx.moveTo(x,0); ctx.lineTo(x,H);} 
+    for (let y = (H/2)%step; y < H; y += step){ ctx.moveTo(0,y); ctx.lineTo(W,y);} 
+    ctx.stroke();
+
+    ctx.strokeStyle = '#2a3a51';
+    ctx.beginPath();
+    ctx.moveTo(cx-12, cy); ctx.lineTo(cx+12, cy);
+    ctx.moveTo(cx, cy-12); ctx.lineTo(cx, cy+12);
+    ctx.stroke();
+  }
+
+  function draw(){
+    requestAnimationFrame(draw);
+    frames++;
+    const now = performance.now();
+    if (now - lastFpsTime >= 500){ fps = Math.round(frames * 1000 / (now - lastFpsTime)); frames = 0; lastFpsTime = now; fpsEl.textContent = fps; epsEl.textContent = eps; }
+
+    const scale = +scaleEl.value;
+    drawGrid(anchor.x, anchor.y, scale);
+
+    ctx.save();
+    ctx.translate(anchor.x, anchor.y);
+
+    ctx.globalAlpha = 1;
+    ctx.lineWidth = 1.5 * dpr;
+    ctx.strokeStyle = '#3ee07f';
+    ctx.beginPath();
+    let first = true;
+    for (let i = Math.max(0, positions.length - 1200); i < positions.length; i++){
+      const p = positions[i];
+      const x = p.x * scale, y = p.y * scale;
+      if (first) { ctx.moveTo(x,y); first = false; } else { ctx.lineTo(x,y); }
+    }
+    ctx.stroke();
+
+    const N = positions.length;
+    for (let i = 0; i < N; i+= Math.max(1, Math.floor(N/200))){
+      const a = (i / N);
+      const p = positions[i];
+      ctx.globalAlpha = 0.15 + 0.7 * a;
+      ctx.fillStyle = '#9df5c2';
+      ctx.beginPath();
+      ctx.arc(p.x*scale, p.y*scale, 2*dpr, 0, Math.PI*2);
+      ctx.fill();
+    }
+    ctx.restore();
+
+    const pad = 20*dpr;
+    const scopeW = Math.min(W*0.5, 640*dpr);
+    const scopeH = Math.min(H*0.28, 220*dpr);
+    const scopeX = W - scopeW - pad;
+    const scopeY = H - scopeH - pad;
+
+    ctx.fillStyle = '#0e141d';
+    ctx.fillRect(scopeX, scopeY, scopeW, scopeH);
+    ctx.strokeStyle = '#1e2a3b';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let x = scopeX; x <= scopeX+scopeW; x += 40*dpr){ ctx.moveTo(x, scopeY); ctx.lineTo(x, scopeY+scopeH);} 
+    for (let y = scopeY; y <= scopeY+scopeH; y += 40*dpr){ ctx.moveTo(scopeX, y); ctx.lineTo(scopeX+scopeW, y);} 
+    ctx.stroke();
+
+    const midY = scopeY + scopeH/2;
+    const samples = deltas.slice(-Math.floor(scopeW/2));
+    ctx.strokeStyle = '#7fb7ff';
+    ctx.beginPath();
+    for (let i = 0; i < samples.length; i++){
+      const v = samples[i].dx;
+      const x = scopeX + i*(scopeW/samples.length);
+      const y = midY - v*4*dpr;
+      if (i === 0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+
+    ctx.strokeStyle = '#ffc07f';
+    ctx.beginPath();
+    for (let i = 0; i < samples.length; i++){
+      const v = samples[i].dy;
+      const x = scopeX + i*(scopeW/samples.length);
+      const y = midY - v*4*dpr;
+      if (i === 0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+
+    const stats = computeStats();
+    rmsEl.textContent = stats.rms.toFixed(2);
+
+    ctx.fillStyle = '#9db0c9';
+    ctx.font = `${12*dpr}px system-ui, sans-serif`;
+    ctx.fillText('Δx', scopeX + 8*dpr, scopeY + 16*dpr);
+    ctx.fillText('Δy', scopeX + 42*dpr, scopeY + 16*dpr);
+    ctx.fillText('Hold still to measure sensor jitter', scopeX + 8*dpr, scopeY + scopeH - 10*dpr);
+  }
+  draw();
+})();
+</script>
+</body>
+</html>
